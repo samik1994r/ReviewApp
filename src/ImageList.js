@@ -1,7 +1,9 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import ImageItem from './ImageItem';
 import ImageViewer from './ImageViewer';
 import { Upload, Search, Trash2, Download } from 'lucide-react';
+import { storage } from './firebase';
+import { ref, uploadBytes, getDownloadURL, deleteObject, listAll } from 'firebase/storage';
 
 const ImageList = () => {
   const [images, setImages] = useState([]);
@@ -10,16 +12,57 @@ const ImageList = () => {
   const [selectedImages, setSelectedImages] = useState([]);
   const [selectedVariations, setSelectedVariations] = useState([]);
 
-  const handleImageUpload = (event) => {
+  useEffect(() => {
+    // Load images from Firebase Storage when component mounts
+    loadImagesFromFirebase();
+  }, []);
+
+  const loadImagesFromFirebase = async () => {
+    const imagesRef = ref(storage, 'images');
+    try {
+      const res = await listAll(imagesRef);
+      const imagePromises = res.items.map(async (itemRef) => {
+        const url = await getDownloadURL(itemRef);
+        return {
+          id: itemRef.name,
+          url: url,
+          file: { name: itemRef.name },
+          status: 'Needs Review',
+          variations: [],
+          comments: []
+        };
+      });
+      const loadedImages = await Promise.all(imagePromises);
+      setImages(loadedImages);
+    } catch (error) {
+      console.error("Error loading images: ", error);
+    }
+  };
+
+  const handleImageUpload = async (event) => {
     const files = Array.from(event.target.files);
-    const newImages = files.map(file => ({
-      id: Date.now() + Math.random(),
-      url: URL.createObjectURL(file),
-      file: file,
-      status: 'Needs Review',
-      variations: [],
-      comments: []
-    }));
+    const newImages = [];
+
+    for (const file of files) {
+      const storageRef = ref(storage, 'images/' + file.name);
+
+      try {
+        const snapshot = await uploadBytes(storageRef, file);
+        const url = await getDownloadURL(snapshot.ref);
+
+        newImages.push({
+          id: snapshot.ref.name,
+          url: url,
+          file: file,
+          status: 'Needs Review',
+          variations: [],
+          comments: []
+        });
+      } catch (error) {
+        console.error("Error uploading file: ", error);
+      }
+    }
+
     setImages(prevImages => [...prevImages, ...newImages]);
   };
 
@@ -46,33 +89,47 @@ const ImageList = () => {
     return image;
   };
 
-  const addImageVariation = (parentId, file) => {
-    setImages(prevImages => 
-      prevImages.map(image => 
-        addImageVariationRecursive(image, parentId, file)
-      )
-    );
+  const addImageVariation = async (parentId, file) => {
+    const parentImage = findImageById(images, parentId);
+    if (!parentImage) return;
+
+    const variationRef = ref(storage, `images/${parentImage.file.name}/variations/${file.name}`);
+
+    try {
+      const snapshot = await uploadBytes(variationRef, file);
+      const url = await getDownloadURL(snapshot.ref);
+
+      const newVariation = {
+        id: snapshot.ref.name,
+        url: url,
+        file: file,
+        status: 'Needs Review',
+        comments: [],
+        variations: []
+      };
+
+      setImages(prevImages => 
+        prevImages.map(image => 
+          addImageVariationRecursive(image, parentId, newVariation)
+        )
+      );
+    } catch (error) {
+      console.error("Error uploading variation: ", error);
+    }
   };
 
-  const addImageVariationRecursive = (image, parentId, file) => {
+  const addImageVariationRecursive = (image, parentId, newVariation) => {
     if (image.id === parentId) {
       return {
         ...image,
-        variations: [...(image.variations || []), {
-          id: Date.now() + Math.random(),
-          url: URL.createObjectURL(file),
-          file: file,
-          status: 'Needs Review',
-          comments: [],
-          variations: []
-        }]
+        variations: [...(image.variations || []), newVariation]
       };
     }
     if (image.variations) {
       return {
         ...image,
         variations: image.variations.map(variation => 
-          addImageVariationRecursive(variation, parentId, file)
+          addImageVariationRecursive(variation, parentId, newVariation)
         )
       };
     }
@@ -176,7 +233,33 @@ const ImageList = () => {
     return updatedImage;
   };
 
-  const removeSelectedItems = () => {
+  const removeSelectedItems = async () => {
+    for (const imageId of selectedImages) {
+      const image = findImageById(images, imageId);
+      if (image) {
+        const storageRef = ref(storage, `images/${image.file.name}`);
+        try {
+          await deleteObject(storageRef);
+        } catch (error) {
+          console.error("Error deleting file: ", error);
+        }
+      }
+    }
+
+    for (const variationKey of selectedVariations) {
+      const [parentId, variationId] = variationKey.split('-');
+      const parentImage = findImageById(images, parentId);
+      const variation = parentImage?.variations.find(v => v.id === variationId);
+      if (variation) {
+        const storageRef = ref(storage, `images/${parentImage.file.name}/variations/${variation.file.name}`);
+        try {
+          await deleteObject(storageRef);
+        } catch (error) {
+          console.error("Error deleting variation: ", error);
+        }
+      }
+    }
+
     setImages(prevImages => 
       prevImages.filter(image => !selectedImages.includes(image.id))
         .map(image => removeSelectedItemsRecursive(image))
